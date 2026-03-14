@@ -96,7 +96,6 @@ def train_stage2(
     categorical_cols: list[str] | None = None,
     drop_features: list[str] | None = None,
     label_smoothing: float = 0.15,
-    prune_features: bool = True,
 ) -> tuple[lgb.Booster, list[str]]:
     """Train Stage 2: tinkering (0) vs works_oob (1), non-borked only.
 
@@ -129,16 +128,6 @@ def train_stage2(
         X_train_s2 = X_train_s2.drop(columns=existing_drops)
         X_test_s2 = X_test_s2.drop(columns=existing_drops)
         logger.info("Stage 2: dropped features %s", existing_drops)
-
-    # Phase 17.5: Prune to top-30 features (same F1, less noise)
-    if prune_features:
-        keep = [c for c in STAGE2_KEEP_FEATURES if c in X_train_s2.columns]
-        extra_drop = [c for c in X_train_s2.columns if c not in keep]
-        if extra_drop:
-            X_train_s2 = X_train_s2[keep]
-            X_test_s2 = X_test_s2[keep]
-            existing_drops += extra_drop
-            logger.info("Stage 2: pruned to %d features (dropped %d)", len(keep), len(extra_drop))
 
     cat_cols_s2 = [c for c in categorical_cols if c in X_train_s2.columns]
 

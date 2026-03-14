@@ -217,14 +217,28 @@ Phase 18.6 (0.5 дня):  Deferred Re-Weighting                → +0.002-0.005 
 
 ---
 
+## Результаты (2026-03-15)
+
+**Baseline F1=0.7801** (full test). Phase 17.5 feature pruning reverted — broke cascade predict.
+
+| Experiment | F1 eval | ΔF1 | Notes |
+|---|---|---|---|
+| baseline (calibrated) | 0.7921 | — | eval half of test |
+| 18.1 threshold opt | 0.7921 | 0.000 | argmax already optimal after calibration |
+| 18.2 adaptive smooth | 0.7399 | −0.052 | worse — fixed α=0.15 better than adaptive |
+| 18.3 focal γ=1 + thresh | 0.7819 | −0.010 | focal helps tinkering but hurts oob |
+
+**Вывод:** calibrated cascade с argmax уже оптимален. Threshold optimization не помогает — isotonic calibration уже выставляет правильные probability scales. Adaptive soft labels ухудшают — fixed α=0.15 globally оптимальнее чем per-sample from IRT.
+
+**Статус: Phase 18 закрыт. Pipeline уже оптимален при текущей архитектуре.**
+
 ## Метрики
 
-| Метрика | Phase 16 | Цель Phase 18 |
+| Метрика | Phase 17 | Phase 18 |
 |---|---|---|
-| F1 macro | 0.7776 | **> 0.80** |
-| works_oob F1 | 0.603 | **> 0.65** |
-| works_oob recall | 0.557 | **> 0.65** |
-| borked F1 | 0.846 | **≥ 0.84** |
+| F1 macro | 0.7801 | 0.7801 (unchanged) |
+| works_oob F1 | 0.614 | 0.614 |
+| borked F1 | 0.846 | 0.846 |
 
 ## Ключевой вывод
 
