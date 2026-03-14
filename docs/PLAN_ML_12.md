@@ -290,18 +290,87 @@ P(tinkering) = σ(a_i * (θ_j − d_i))
 
 ---
 
+## Результаты (2026-03-14)
+
+### Прогон 1: IRT без сходимости
+
+**Условия:** coverage 30.7% train / 54.5% test. IRT не сошёлся (inf в theta из-за log(0) в инициализации).
+
+| Experiment | F1 macro | ΔF1 | borked | tinkering | works_oob |
+|---|---|---|---|---|---|
+| baseline | 0.7245 | — | 0.834 | 0.837 | 0.503 |
+| 12.8a IRT features | 0.7412 | +0.017 | 0.838 | 0.848 | 0.538 |
+| 12.8c IRT full | 0.7434 | +0.019 | 0.838 | 0.848 | 0.544 |
+| 12.1+12.3+12.8 all | 0.7438 | +0.019 | 0.839 | 0.844 | 0.549 |
+
+### Прогон 2: IRT с фиксом (аналитический градиент + правильная инициализация)
+
+**Условия:** coverage 43.2% train / 65.8% test. IRT сошёлся за 0.3s, 111 итераций. 9020 contributors, 13951 items.
+
+| Experiment | F1 macro | ΔF1 | borked | tinkering | works_oob |
+|---|---|---|---|---|---|
+| **baseline** | 0.7245 | — | 0.834 | 0.837 | 0.503 |
+| 12.1 contrib features | 0.7232 | −0.001 | 0.837 | 0.834 | 0.498 |
+| 12.3a weight log | 0.7202 | −0.004 | 0.834 | 0.834 | 0.493 |
+| 12.3b weight bucket | 0.7196 | −0.005 | 0.834 | 0.835 | 0.490 |
+| 12.1+12.3 combined | 0.7253 | +0.001 | 0.837 | 0.835 | 0.504 |
+| **12.8a IRT features** | **0.7519** | **+0.027** | 0.837 | 0.856 | 0.563 |
+| 12.8b IRT weights | 0.7210 | −0.004 | 0.834 | 0.833 | 0.496 |
+| **12.8c IRT full** | **0.7536** | **+0.029** | 0.837 | 0.857 | 0.567 |
+| **12.1+12.3+12.8 all** | **0.7545** | **+0.030** | 0.840 | 0.855 | 0.569 |
+
+### Выводы
+
+1. **IRT — прорыв: +0.030 F1** (0.7245 → 0.7545). Фикс инициализации дал дополнительные +0.011 (с 0.7438 до 0.7545). Аналитический градиент: сходимость за 0.3s вместо 111s.
+
+2. **works_oob F1: 0.503 → 0.569** (+0.066) — самый большой прогресс за всю историю проекта. IRT difficulty score — объективная мера "сложности" пары (game, GPU), очищенная от annotator bias.
+
+3. **tinkering F1: 0.837 → 0.857** (+0.020) — неожиданный бонус: IRT улучшает обе стороны Stage 2 boundary.
+
+4. **12.1 (contributor features)** — нейтральный/отрицательный. report_tally и playtime не прямые сигналы.
+
+5. **12.3 (sample weighting)** — отрицательный (−0.004..−0.005). Downweighting при неполном coverage вредит.
+
+6. **IRT weights (12.8b)** — отрицательный (−0.004). LightGBM с label smoothing уже устойчив к extreme annotators.
+
+7. **Комбинация 12.1+12.3+12.8** — лучший результат (0.7545), но прирост над 12.8c (0.7536) минимален (+0.001). IRT features — доминирующий фактор.
+
+### Прогон 3: 2PL IRT (discrimination parameter)
+
+**Условия:** те же. 2PL сошёлся за 1.3s, 261 итерация. NLL: 2086 (vs 4813 для 1PL). Discrimination `a`: mean=4.15, std=3.36, range=[0.05, 20.09].
+
+| Experiment | F1 macro | ΔF1 vs 1PL | borked | tinkering | works_oob |
+|---|---|---|---|---|---|
+| 1PL baseline | 0.7705 | — | 0.836 | 0.885 | 0.590 |
+| **2PL features+relabel** | **0.7724** | **+0.002** | 0.838 | 0.887 | 0.593 |
+| **2PL disc_aware 0.3** | **0.7734** | **+0.003** | 0.838 | 0.887 | 0.595 |
+| 2PL disc_aware 0.5 | 0.7712 | +0.001 | 0.838 | 0.887 | 0.588 |
+| 2PL disc_aware 0.8 | 0.7717 | +0.001 | 0.838 | 0.886 | 0.591 |
+| 2PL disc_aware 1.0 | 0.7712 | +0.001 | 0.838 | 0.886 | 0.589 |
+
+**Вывод:** 2PL даёт стабильные +0.002-0.003 F1 поверх 1PL. `irt_game_discrimination` — полезная фича. Disc-aware relabeling с min_disc=0.3 лучший вариант, но фильтрует всего 2 items — эффект в основном от features, не от relabeling.
+
+### TODO
+
+- [x] Пофиксить IRT инициализацию (clip initial theta, аналитический градиент)
+- [x] Попробовать 2PL IRT (с discrimination parameter a_i) — +0.003 F1
+- [x] Интегрировать IRT в основной pipeline (`ml/irt.py`, `train.py`)
+- [ ] Перезапустить после полного сбора данных (~55% coverage)
+- [x] Phase 13: IRT-informed relabeling (см. PLAN_ML_13.md) — +0.015 F1
+
+---
+
 ## Порядок реализации
 
 ```
 Phase 12.1 (1 день):   Contributor features                       → +0.003-0.008 F1
 Phase 12.3 (1 день):   Confidence weighting (можно без 12.2)      → +0.003-0.008 F1
 Phase 12.8 (3-4 дня):  IRT — главный эксперимент                  → +0.010-0.025 F1
-Phase 12.7 (2 дня):    Binary + contributor split                  → +0.010-0.030 F1
-Phase 12.2 (2-3 дня):  Dawid-Skene denoising (альтернатива 12.8)  → +0.005-0.015 F1
-Phase 12.5 (2 дня):    Annotator bias correction                  → +0.005-0.012 F1
-Phase 12.6 (2-3 дня):  Self-training с contributor priors          → +0.005-0.010 F1
-Phase 12.4 (2-3 дня):  Annotator embeddings (experimental)        → +0.005-0.010 F1
-                                                            Итого:   +0.02-0.06 F1
+Phase 12.7 (закрыт):   Binary + contributor split          — IRT решает boundary лучше
+Phase 12.2 (закрыт):   Dawid-Skene                        — IRT строго лучше (1 param vs K×K)
+Phase 12.5 (закрыт):   Annotator bias correction          — Phase 13.2 делает это через θ
+Phase 12.6 → 13.4:     Self-training с IRT                 → перенесён в PLAN_ML_13
+Phase 12.4 → 13.5:     Annotator embeddings (SVD)          → перенесён в PLAN_ML_13
 ```
 
 **Приоритет:** 12.1 → 12.3 → 12.8 → 12.7 → 12.5 → 12.6 → 12.2 → 12.4
@@ -318,16 +387,16 @@ Phase 12.4 (2-3 дня):  Annotator embeddings (experimental)        → +0.005-
 
 | Phase | Мин. покрытие | Текущее | Достаточно? |
 |---|---|---|---|
-| 12.1 (features) | 10%+ | ~5% (сбор идёт) | Нет, подождать |
-| 12.3 (weights) | 10%+ | ~5% | Нет, подождать |
-| 12.8 (IRT) | 25%+, 3K+ contributors с 3+ items | ~5% | Нет |
-| 12.7 (binary + split) | 15%+ | ~5% | Нет |
-| 12.2 (Dawid-Skene) | 20%+, 5K+ contributors | ~5% | Нет |
-| 12.5 (bias correction) | 15%+, contributors с 5+ reports | ~5% | Нет |
-| 12.6 (self-training) | 10%+ | ~5% | Нет |
-| 12.4 (embeddings) | 30%+, 5K+ contributors с 2+ играми | ~5% | Нет |
+| 12.1 (features) | 10%+ | ~54% (сбор идёт) | ✅ Да |
+| 12.3 (weights) | 10%+ | ~54% | ✅ Да |
+| 12.8 (IRT) | 25%+, 3K+ contributors с 3+ items | ~54%, 8.3K contributors | ✅ Да |
+| 12.7 (binary + split) | 15%+ | ~54% | ✅ Да |
+| 12.2 (Dawid-Skene) | 20%+, 5K+ contributors | ~54%, 55K unique | ✅ Да |
+| 12.5 (bias correction) | 15%+, contributors с 5+ reports | ~54% | ✅ Да |
+| 12.6 (self-training) | 10%+ | ~54% | ✅ Да |
+| 12.4 (embeddings) | 30%+, 5K+ contributors с 2+ играми | ~54%, 18K c 2+ играми | ✅ Да |
 
-**Блокер:** Сбор данных (~8 часов для полного покрытия). Максимальное покрытие: ~55% (API лимит 40 reports/game).
+**Сбор данных:** ~54% (16.8K/31K игр), ETA ~4 часа до полного покрытия. Максимум: ~55% (API лимит 40 reports/game). Все фазы разблокированы.
 
 ---
 

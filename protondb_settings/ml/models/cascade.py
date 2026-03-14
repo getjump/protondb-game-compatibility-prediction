@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 # Features to exclude from Stage 2 (temporal bias)
 STAGE2_DROP_FEATURES = ["report_age_days"]
 
+# Phase 17.5: Top-30 Stage 2 features by gain. 30 features = same F1 as 121.
+# Used when stage2_pruning=True to drop noise features.
+STAGE2_KEEP_FEATURES = [
+    "variant", "contributor_consistency", "irt_contributor_strictness",
+    "game_emb_0", "concluding_notes_length", "game_verdict_agreement",
+    "game_emb_3", "irt_game_difficulty", "has_concluding_notes",
+    "game_emb_1", "gpu_family", "has_customization_notes",
+    "nvidia_driver_version", "mesa_driver_version", "game_emb_2",
+    "total_notes_length", "game_emb_5", "game_emb_12",
+    "text_emb_1", "game_emb_4", "game_emb_7", "text_emb_2",
+    "game_emb_9", "game_emb_11", "agg_cust_config_change",
+    "text_emb_0", "text_emb_4", "game_emb_13", "game_emb_8", "text_emb_8",
+]
+
 
 def train_stage1(
     X_train: pd.DataFrame,
@@ -48,7 +62,7 @@ def train_stage1(
     y_test_bin = (y_test > 0).astype(int)
 
     model = lgb.LGBMClassifier(
-        n_estimators=2000, num_leaves=63, learning_rate=0.03,
+        n_estimators=3000, num_leaves=63, learning_rate=0.05,
         max_depth=-1, min_child_samples=20, subsample=0.8,
         colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
         class_weight=class_weight, n_jobs=-1, random_state=42,
@@ -82,6 +96,7 @@ def train_stage2(
     categorical_cols: list[str] | None = None,
     drop_features: list[str] | None = None,
     label_smoothing: float = 0.15,
+    prune_features: bool = True,
 ) -> tuple[lgb.Booster, list[str]]:
     """Train Stage 2: tinkering (0) vs works_oob (1), non-borked only.
 
@@ -115,6 +130,16 @@ def train_stage2(
         X_test_s2 = X_test_s2.drop(columns=existing_drops)
         logger.info("Stage 2: dropped features %s", existing_drops)
 
+    # Phase 17.5: Prune to top-30 features (same F1, less noise)
+    if prune_features:
+        keep = [c for c in STAGE2_KEEP_FEATURES if c in X_train_s2.columns]
+        extra_drop = [c for c in X_train_s2.columns if c not in keep]
+        if extra_drop:
+            X_train_s2 = X_train_s2[keep]
+            X_test_s2 = X_test_s2[keep]
+            existing_drops += extra_drop
+            logger.info("Stage 2: pruned to %d features (dropped %d)", len(keep), len(extra_drop))
+
     cat_cols_s2 = [c for c in categorical_cols if c in X_train_s2.columns]
 
     for col in cat_cols_s2:
@@ -127,7 +152,13 @@ def train_stage2(
         y_smooth = y_smooth * (1 - label_smoothing) + (1 - y_smooth) * label_smoothing
         logger.info("Stage 2: label smoothing alpha=%.2f", label_smoothing)
 
-    ds_train = lgb.Dataset(X_train_s2, label=y_smooth, categorical_feature=cat_cols_s2)
+    # Phase 16+17: upweight works_oob (class 1) to compensate for temporal
+    # distribution shift (9.9% train vs 18.1% test). oob_weight=1.8, reg=1.0 (Phase 17.1)
+    sample_weight = np.ones(len(y_train_s2))
+    sample_weight[y_train_s2 >= 0.5] = 1.8  # works_oob (after smoothing: 0.85)
+
+    ds_train = lgb.Dataset(X_train_s2, label=y_smooth, weight=sample_weight,
+                           categorical_feature=cat_cols_s2)
     ds_test = lgb.Dataset(X_test_s2, label=y_test_s2, categorical_feature=cat_cols_s2)
 
     # Phase 9.1: cross_entropy + noise-robust params
@@ -135,13 +166,13 @@ def train_stage2(
         "objective": "cross_entropy",
         "metric": "binary_logloss",
         "num_leaves": 63,
-        "learning_rate": 0.02,
+        "learning_rate": 0.03,
         "min_child_samples": 50,
         "subsample": 0.8,
         "subsample_freq": 1,
         "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0,
         "min_split_gain": 0.05,
         "verbose": -1,
     }
@@ -149,7 +180,7 @@ def train_stage2(
     model = lgb.train(
         params,
         ds_train,
-        num_boost_round=3000,
+        num_boost_round=2000,
         valid_sets=[ds_test],
         callbacks=[
             lgb.early_stopping(100, verbose=False),

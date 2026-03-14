@@ -526,6 +526,7 @@ def train_cascade_pipeline(
     normalized_data_source: str | None = None,
     embeddings_path: str | Path | None = None,
     force_embeddings: bool = False,
+    reuse_stage1: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run cascade ML training: Stage 1 (borked/works) + Stage 2 (tinkering/oob).
 
@@ -534,6 +535,9 @@ def train_cascade_pipeline(
             If None, looks for {output_dir}/embeddings.npz.
         force_embeddings: If True, rebuild all embeddings from scratch
             even if cached file exists.
+        reuse_stage1: Path to a saved Stage 1 model (.pkl) to skip
+            Stage 1 training. Useful for experiments that only change
+            Stage 2 (relabeling, tinkering/oob boundary).
 
     Returns evaluation results dict.
     """
@@ -644,8 +648,16 @@ def train_cascade_pipeline(
         for val, cnt in zip(unique, counts):
             console.print(f"  {TARGET_NAMES.get(val, val)}: {cnt} ({cnt/len(y)*100:.1f}%)")
 
-        # Step 3b: Relabel tinkering→works_oob for training (Phase 8)
-        console.print("\n[bold]Step 3b/9: Relabeling noisy tinkering→works_oob...[/bold]")
+        # Step 3b: IRT fitting + contributor-aware relabeling (Phase 12.8 + 13.2)
+        console.print("\n[bold]Step 3b/9: IRT fitting (annotator-game decomposition)...[/bold]")
+        from .irt import fit_irt, add_irt_features, contributor_aware_relabel, add_error_targeted_features
+
+        irt_theta, irt_difficulty = fit_irt(conn)
+        if irt_theta:
+            console.print(f"  IRT: {len(irt_theta)} contributors, {len(irt_difficulty)} items")
+        else:
+            console.print("  [yellow]IRT: not enough contributor data, skipping[/yellow]")
+
         relabel_ids = get_relabel_ids(conn)
 
         # Step 4: Train/test/calibration split
@@ -654,20 +666,36 @@ def train_cascade_pipeline(
             X, y, timestamps, test_fraction, report_ids=report_ids,
         )
 
-        # Apply relabeling only to training set
-        y_train, n_relabeled = apply_relabeling(y_train, train_rids, relabel_ids)
-        console.print(f"  Relabeled {n_relabeled} training samples (tinkering → works_oob)")
+        # Add IRT features (Phase 12.8: +0.030 F1)
+        if irt_theta:
+            console.print("  Adding IRT features...")
+            X_train = add_irt_features(X_train, train_rids, conn, irt_theta, irt_difficulty)
+            X_test = add_irt_features(X_test, _test_rids, conn, irt_theta, irt_difficulty)
 
-        # Step 3c: Cleanlab noise removal (Phase 9.3)
-        console.print("\n[bold]Step 3c/9: Cleanlab noise removal (3%)...[/bold]")
-        from .noise import find_noisy_samples
-        keep_mask = find_noisy_samples(X_train, y_train, frac_remove=0.03,
-                                       cache_dir=output_dir, force=force_embeddings)
-        n_removed = (~keep_mask).sum()
-        X_train = X_train[keep_mask].reset_index(drop=True)
-        y_train = y_train[keep_mask]
-        train_rids = [rid for rid, keep in zip(train_rids, keep_mask) if keep]
-        console.print(f"  Removed {n_removed} noisy samples ({n_removed/(n_removed+len(y_train))*100:.1f}%)")
+        # Add error-targeted features (Phase 16.6: +0.006 F1 with class weighting)
+        console.print("  Adding error-targeted features...")
+        X_train = add_error_targeted_features(X_train, train_rids, conn)
+        X_test = add_error_targeted_features(X_test, _test_rids, conn)
+
+        # Contributor-aware relabeling (Phase 13.2: +0.015 F1)
+        # Replaces Phase 8 blind relabeling + Cleanlab noise removal
+        if irt_theta:
+            y_train, n_relabeled = contributor_aware_relabel(
+                y_train, train_rids, relabel_ids, conn, irt_theta)
+            console.print(f"  Contributor-aware relabel: {n_relabeled} tinkering → works_oob")
+        else:
+            # Fallback: Phase 8 + Cleanlab when no contributor data
+            y_train, n_relabeled = apply_relabeling(y_train, train_rids, relabel_ids)
+            console.print(f"  Fallback (Phase 8): relabeled {n_relabeled} tinkering → works_oob")
+
+            from .noise import find_noisy_samples
+            keep_mask = find_noisy_samples(X_train, y_train, frac_remove=0.03,
+                                           cache_dir=output_dir, force=force_embeddings)
+            n_removed = (~keep_mask).sum()
+            X_train = X_train[keep_mask].reset_index(drop=True)
+            y_train = y_train[keep_mask]
+            train_rids = [rid for rid, keep in zip(train_rids, keep_mask) if keep]
+            console.print(f"  Cleanlab: removed {n_removed} noisy samples")
 
         # Show post-cleaning distribution
         for val, name in [(0, "borked"), (1, "tinkering"), (2, "works_oob")]:
@@ -691,9 +719,15 @@ def train_cascade_pipeline(
         console.print(f"  Train: {len(X_train)}, Calibration: {len(X_cal)}, Eval: {len(X_eval)}")
 
         # Step 4: Train Stage 1 (borked vs works)
-        console.print("\n[bold]Step 5/9: Training Stage 1 (borked vs works)...[/bold]")
-        s1_model = train_stage1(X_train, y_train, X_test, y_test)
-        console.print(f"  Best iteration: {s1_model.best_iteration_}")
+        if reuse_stage1 is not None:
+            console.print(f"\n[bold]Step 5/9: Reusing Stage 1 from {reuse_stage1}[/bold]")
+            import joblib
+            s1_model = joblib.load(reuse_stage1)
+            console.print(f"  Loaded (best iteration: {s1_model.best_iteration_})")
+        else:
+            console.print("\n[bold]Step 5/9: Training Stage 1 (borked vs works)...[/bold]")
+            s1_model = train_stage1(X_train, y_train, X_test, y_test)
+            console.print(f"  Best iteration: {s1_model.best_iteration_}")
 
         y_s1_test = (y_test > 0).astype(int)
         y_s1_pred = s1_model.predict(X_test)

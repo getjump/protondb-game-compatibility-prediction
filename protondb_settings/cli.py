@@ -242,7 +242,7 @@ def _add_step_row(table, conn, step_name: str, display_name: str, pending: int) 
 @click.option("--force", is_flag=True, help="Reset step data and start fresh.")
 @click.option("--min-reports", type=int, default=1,
               help="Enrichment: only games with at least N reports.")
-@click.option("--source", type=click.Choice(["steam", "pcgamingwiki", "protondb", "protondb_reports", "anticheat"]),
+@click.option("--source", type=click.Choice(["steam", "pcgamingwiki", "protondb", "protondb_reports", "steam_pics", "anticheat"]),
               default=None, help="Enrichment: only run specific source.")
 @click.option("--refresh-older-than", type=str, default=None,
               help="Enrichment: re-enrich entries older than Nd (e.g. '30d').")
@@ -561,10 +561,12 @@ def ml_train(config: Config, output_dir: Path | None, test_fraction: float, norm
               help="Path to existing embeddings.npz to reuse (default: {output-dir}/embeddings.npz).")
 @click.option("--force-embeddings", is_flag=True, default=False,
               help="Rebuild all embeddings from scratch, ignoring cache.")
+@click.option("--reuse-stage1", type=click.Path(path_type=Path), default=None,
+              help="Reuse saved Stage 1 model to skip retraining (for Stage 2 experiments).")
 @pass_config
 def ml_train_cascade(config: Config, output_dir: Path | None, test_fraction: float,
                      normalized_data: str | None, embeddings_path: Path | None,
-                     force_embeddings: bool) -> None:
+                     force_embeddings: bool, reuse_stage1: Path | None) -> None:
     """Train two-stage cascade classifier (borked/works → tinkering/oob)."""
     import logging
 
@@ -584,6 +586,7 @@ def ml_train_cascade(config: Config, output_dir: Path | None, test_fraction: flo
         normalized_data_source=normalized_data,
         embeddings_path=embeddings_path,
         force_embeddings=force_embeddings,
+        reuse_stage1=reuse_stage1,
     )
     conn.close()
 

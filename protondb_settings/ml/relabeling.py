@@ -68,7 +68,7 @@ def get_relabel_ids(conn: sqlite3.Connection) -> set[str]:
             relabel.append(r["id"])
 
     logger.info(
-        "Relabeling: %d/%d tinkering reports → works_oob (%.1f%%)",
+        "Relabel candidates: %d/%d tinkering without effort markers (%.1f%%)",
         len(relabel), len(rows), 100 * len(relabel) / len(rows) if rows else 0,
     )
     return set(relabel)

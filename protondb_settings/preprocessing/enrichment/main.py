@@ -60,6 +60,9 @@ from protondb_settings.preprocessing.enrichment.sources.protondb_reports import 
     extract_contributor_data,
     fetch_reports as fetch_protondb_reports,
 )
+from protondb_settings.preprocessing.enrichment.sources.steam_pics import (
+    fetch_pics_batch,
+)
 from protondb_settings.preprocessing.enrichment.sources.steam import (
     fetch_deck_status,
     fetch_steam,
@@ -349,6 +352,67 @@ def _worker_pcgamingwiki(
         conn.close()
 
 
+def _worker_steam_pics(
+    db_path: Path, app_ids: list[int], progress: _WorkerProgress,
+) -> None:
+    """Fetch Steam PICS data in batches of 200 (bulk CM protocol)."""
+    conn = get_connection(db_path)
+    try:
+        cached = _get_cached_set(conn, "steam_pics")
+        to_fetch = [aid for aid in app_ids if aid not in cached]
+
+        cached_count = len(app_ids) - len(to_fetch)
+        progress.print(f"Steam PICS: {len(to_fetch)} to fetch ({cached_count} cached)")
+        progress.advance(cached_count)
+
+        for batch in chunked(to_fetch, 100):
+            if shutdown_requested.is_set():
+                break
+            try:
+                batch_result = fetch_pics_batch(batch)
+                for aid in batch:
+                    if aid in batch_result:
+                        data = batch_result[aid]
+                        _set_cached(conn, aid, "steam_pics", {
+                            "name": data.name,
+                            "app_type": data.app_type,
+                            "oslist": data.oslist,
+                            "osarch": data.osarch,
+                            "deck_category": data.deck_category,
+                            "steamos_compatibility": data.steamos_compatibility,
+                            "recommended_runtime": data.recommended_runtime,
+                            "deck_test_results": data.deck_test_results,
+                            "has_linux_launch": data.has_linux_launch,
+                            "has_windows_launch": data.has_windows_launch,
+                            "launch_count": data.launch_count,
+                            "linux_depot_count": data.linux_depot_count,
+                            "windows_depot_count": data.windows_depot_count,
+                            "total_depot_count": data.total_depot_count,
+                            "review_score": data.review_score,
+                            "review_percentage": data.review_percentage,
+                            "developer": data.developer,
+                            "publisher": data.publisher,
+                            "is_free": data.is_free,
+                            "primary_genre": data.primary_genre,
+                        })
+                    else:
+                        _set_cached(conn, aid, "steam_pics", _EMPTY)
+                conn.commit()
+            except Exception as exc:
+                progress.print(f"[yellow]Steam PICS: batch failed ({len(batch)} ids): {exc}[/]")
+                progress.error()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+            progress.advance(len(batch))
+    finally:
+        from protondb_settings.preprocessing.enrichment.sources.steam_pics import disconnect
+        disconnect()
+        conn.close()
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 
@@ -359,20 +423,20 @@ def _get_pending_app_ids(
     refresh_older_than_days: int | None = None,
     source: str | None = None,
 ) -> list[int]:
-    # protondb_reports writes to report_contributors, not game_metadata —
-    # pending list is based on enrichment_cache, not game_metadata.
-    if source == "protondb_reports":
+    # protondb_reports and steam_pics write to their own tables/cache,
+    # not game_metadata — pending list is based on enrichment_cache.
+    if source in ("protondb_reports", "steam_pics"):
         rows = conn.execute(
             """
             SELECT r.app_id, COUNT(*) as cnt FROM reports r
             WHERE r.app_id NOT IN (
-                SELECT app_id FROM enrichment_cache WHERE source = 'protondb_reports'
+                SELECT app_id FROM enrichment_cache WHERE source = ?
             )
             GROUP BY r.app_id
             HAVING cnt >= ?
             ORDER BY cnt DESC
             """,
-            (min_reports,),
+            (source, min_reports),
         ).fetchall()
         return [row["app_id"] for row in rows]
 
@@ -500,9 +564,8 @@ def _run_enrichment_inner(
 
     # ── Phase 1: Parallel fetch into enrichment_cache ──────────────
 
-    # protondb_reports is report-level (→ report_contributors), not game-level
-    # (→ game_metadata). Skip AWACY/GitHub pre-fetch and Phase 2 merge.
-    skip_merge = source == "protondb_reports"
+    # protondb_reports and steam_pics cache data independently, not via game_metadata merge.
+    skip_merge = source in ("protondb_reports", "steam_pics")
 
     awacy_index: dict[int, AWACYData] = {}
     github_index: dict[int, ProtonGitHubData] = {}
@@ -567,6 +630,10 @@ def _run_enrichment_inner(
         task_ids["pcgamingwiki"] = fetch_progress.add_task("pcgamingwiki", total=len(app_ids))
         worker_configs.append(("pcgamingwiki", _worker_pcgamingwiki, app_ids))
 
+    if source == "steam_pics":
+        task_ids["steam_pics"] = fetch_progress.add_task("steam_pics", total=len(app_ids))
+        worker_configs.append(("steam_pics", _worker_steam_pics, app_ids))
+
     if worker_configs:
         log.info(
             "Fetching from %d sources in parallel: %s",
@@ -623,7 +690,7 @@ def _run_enrichment_inner(
         return len(app_ids)
 
     if skip_merge:
-        log.info("protondb_reports: %d app_ids processed (report_contributors updated)", len(app_ids))
+        log.info("%s: %d app_ids processed (cached)", source, len(app_ids))
         return len(app_ids)
 
     # ── Phase 2: Merge from cache → game_metadata ─────────────────
