@@ -317,8 +317,11 @@ def preprocess_run(
 
 
 @preprocess.group("llm")
+@click.option("--backend", type=click.Choice(["openai", "openrouter", "claude-cli"]),
+              envvar="LLM_BACKEND", default=None,
+              help="LLM backend: openai (default), openrouter, or claude-cli.")
 @click.option("--base-url", envvar="OPENAI_BASE_URL", default=None,
-              help="LLM API base URL.")
+              help="LLM API base URL (openai backend only).")
 @click.option("--model", envvar="MODEL", default=None,
               help="Model name/identifier.")
 @click.option("--api-key", envvar="OPENAI_API_KEY", default=None,
@@ -328,6 +331,7 @@ def preprocess_run(
 @click.pass_context
 def preprocess_llm(
     ctx: click.Context,
+    backend: str | None,
     base_url: str | None,
     model: str | None,
     api_key: str | None,
@@ -337,6 +341,8 @@ def preprocess_llm(
     from protondb_settings.preprocessing.llm.client import LLMClient
 
     kwargs = {}
+    if backend:
+        kwargs["backend"] = backend
     if base_url:
         kwargs["base_url"] = base_url
     if model:
@@ -367,7 +373,7 @@ def _get_llm_conn(config: Config):
     return conn
 
 
-def _run_llm_task(func, conn, llm, *, force: bool = False) -> int | None:
+def _run_llm_task(func, conn, llm, *, force: bool = False, **kwargs) -> int | None:
     """Run an LLM pipeline task with graceful interrupt handling.
 
     Installs signal + stdin watchers for Ctrl+C (including kitty protocol).
@@ -381,7 +387,7 @@ def _run_llm_task(func, conn, llm, *, force: bool = False) -> int | None:
 
     install_handlers()
     try:
-        n = func(conn, llm, force=force)
+        n = func(conn, llm, force=force, **kwargs)
         if shutdown_requested.is_set():
             click.echo("\nInterrupted — progress saved")
             return None
@@ -449,6 +455,23 @@ def llm_extract(ctx: click.Context, force: bool) -> None:
     from protondb_settings.preprocessing.extract.extractor import run_extraction
 
     n = _run_llm_task(run_extraction, conn, ctx.obj["llm"], force=force)
+    if n is not None:
+        click.echo(f"Processed {n} reports")
+    conn.close()
+
+
+@preprocess_llm.command("infer-verdicts")
+@click.option("--force", is_flag=True, help="Delete existing and start fresh.")
+@click.option("--batch-size", type=int, default=5, help="Reports per LLM call.")
+@click.pass_context
+def llm_infer_verdicts(ctx: click.Context, force: bool, batch_size: int) -> None:
+    """Infer verdict_oob for old reports (verdict=yes, oob=NULL) via LLM."""
+    config = ctx.find_root().ensure_object(Config)
+    conn = _get_llm_conn(config)
+    from protondb_settings.preprocessing.extract.verdict_inference import run_verdict_inference
+
+    n = _run_llm_task(run_verdict_inference, conn, ctx.obj["llm"],
+                      force=force, batch_size=batch_size)
     if n is not None:
         click.echo(f"Processed {n} reports")
     conn.close()

@@ -52,19 +52,22 @@ def _detect_ollama(base_url: str) -> str | None:
 
 
 class LLMClient:
-    """OpenAI-compatible LLM client with retry and concurrency.
+    """LLM client with multiple backend support.
+
+    Backends:
+    - "claude-cli": Uses `claude -p` for extraction (Claude Code CLI)
+    - "openai": OpenAI-compatible API (default)
+    - Auto-detected ollama: native /api/chat with think=false
 
     Configuration priority:
     1. Constructor arguments
-    2. Environment variables (OPENAI_BASE_URL, OPENAI_API_KEY, MODEL)
-
-    For ollama: uses native /api/chat with think=false (reasoning disabled).
-    For everything else: standard OpenAI API with json_schema structured output.
+    2. Environment variables (OPENAI_BASE_URL, OPENAI_API_KEY, MODEL, LLM_BACKEND)
     """
 
     def __init__(
         self,
         *,
+        backend: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
@@ -72,14 +75,42 @@ class LLMClient:
         max_retries: int = DEFAULT_LLM_MAX_RETRIES,
         temperature: float = DEFAULT_LLM_TEMPERATURE,
     ) -> None:
-        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8090/v1")
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "not-needed")
-        self.model = model or os.environ.get("MODEL", "qwen2.5-7b-instruct")
+        self.backend = backend or os.environ.get("LLM_BACKEND", "openai")
+
+        # OpenRouter shortcut: backend=openrouter auto-configures base_url
+        if self.backend == "openrouter":
+            self.base_url = "https://openrouter.ai/api/v1"
+            self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+            self.model = model or os.environ.get("MODEL", "anthropic/claude-sonnet-4")
+            if not self.api_key:
+                raise ValueError("OPENROUTER_API_KEY env var or --api-key required for openrouter backend")
+        else:
+            self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:8090/v1")
+            self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "not-needed")
+            self.model = model or os.environ.get("MODEL", "qwen2.5-7b-instruct")
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.temperature = temperature
         self._structured_supported: bool | None = None
         self._cancel: threading.Event | None = None  # set externally for early abort
+
+        if self.backend in ("claude-cli", "openrouter"):
+            if self.backend == "claude-cli":
+                log.info("Using Claude CLI backend (claude -p)")
+            else:
+                log.info("Using OpenRouter backend (model=%s)", self.model)
+            self._ollama_base = None
+            self._http = None
+            if self.backend == "claude-cli":
+                self._client = None
+                return
+            # OpenRouter uses standard OpenAI client
+            self._client = openai.OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=120.0,
+            )
+            return
 
         # Detect ollama for native API (think=false support)
         self._ollama_base = _detect_ollama(self.base_url)
@@ -99,6 +130,8 @@ class LLMClient:
     @property
     def is_local(self) -> bool:
         """Heuristic: consider local if base_url points to localhost."""
+        if self.backend in ("openrouter", "claude-cli"):
+            return False
         return "localhost" in self.base_url or "127.0.0.1" in self.base_url
 
     def _build_response_format(
@@ -130,6 +163,58 @@ class LLMClient:
             content = "\n".join(lines)
         return content
 
+    def _call_claude_cli(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int,
+        json_schema: dict | None = None,
+    ) -> str | None:
+        """Call Claude via CLI: `claude -p --output-format json`."""
+        import subprocess
+
+        # Build prompt from messages
+        system = ""
+        user = ""
+        for m in messages:
+            if m["role"] == "system":
+                system = m["content"]
+            elif m["role"] == "user":
+                user = m["content"]
+
+        prompt = f"{system}\n\n{user}" if system else user
+
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--max-turns", "1",
+            "--no-session-persistence",
+        ]
+        if json_schema:
+            cmd += ["--json-schema", json.dumps(json_schema)]
+        if self.model and self.model != "qwen2.5-7b-instruct":
+            cmd += ["--model", self.model]
+
+        try:
+            result = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                log.warning("Claude CLI error: %s", result.stderr[:200])
+                return None
+
+            # claude --output-format json wraps response in {"type":"result","result":"..."}
+            output = json.loads(result.stdout)
+            if isinstance(output, dict) and "result" in output:
+                return output["result"]
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            log.warning("Claude CLI timeout (120s)")
+            return None
+        except Exception as e:
+            log.warning("Claude CLI error: %s", e)
+            return None
+
     def _call_llm(
         self,
         messages: list[dict],
@@ -137,7 +222,14 @@ class LLMClient:
         max_tokens: int,
         response_format: dict[str, Any],
     ) -> str | None:
-        """Call LLM and return content string. Uses ollama native API if detected."""
+        """Call LLM and return content string. Routes to appropriate backend."""
+        if self.backend == "claude-cli":
+            # Extract json_schema if available
+            schema = None
+            if response_format.get("type") == "json_schema":
+                schema = response_format.get("json_schema", {}).get("schema")
+            return self._call_claude_cli(messages, max_tokens=max_tokens, json_schema=schema)
+
         if self._ollama_base and self._http:
             payload: dict[str, Any] = {
                 "model": self.model,
@@ -204,6 +296,12 @@ class LLMClient:
                 )
                 if not content or not content.strip():
                     log.warning("LLM returned empty content (attempt %d/%d)", attempt + 1, self.max_retries)
+                    # If json_schema mode returned empty twice, fall back to json_object
+                    if used_structured and attempt >= 1 and self._structured_supported is None:
+                        log.info("Falling back to json_object mode (empty responses with json_schema)")
+                        self._structured_supported = False
+                        response_format = {"type": "json_object"}
+                        used_structured = False
                     continue
 
                 content = self._strip_code_fences(content)
