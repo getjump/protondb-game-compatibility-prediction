@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protondb-game-compatibility-prediction"
+version = "0.1.0"
+description = "ML-based game compatibility prediction for Proton/Steam on Linux"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+    { name = "Pavel Savinov", email = "contact@getjump.me" },
+]
+readme = "README.md"
+keywords = ["protondb", "steam", "proton", "linux", "gaming", "compatibility", "machine-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "click>=8.1",
+    "lightgbm>=4.0",
+    "scikit-learn>=1.4",
+    "pydantic>=2.0",
+    "httpx>=0.27",
+    "shap>=0.45",
+    "scipy>=1.12",
+    "rich>=13.0",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "python-dateutil>=2.8",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/getjump/protondb-game-compatibility-prediction"
+Repository = "https://github.com/getjump/protondb-game-compatibility-prediction"
+Issues = "https://github.com/getjump/protondb-game-compatibility-prediction/issues"
+
+[project.scripts]
+protondb-settings = "protondb_settings.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["protondb_settings*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

@@ -1,0 +1,18 @@
+# Environment
+.env
+.venv/
+
+# Data & model artifacts
+data/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Tools
+.ruff_cache/
+catboost_info/
+*.npy
