@@ -117,18 +117,12 @@ def fetch_counts() -> dict:
         raise RuntimeError("Failed to fetch ProtonDB counts.json")
 
 
-def fetch_reports(app_id: int) -> list[dict] | None:
-    """Fetch up to 40 recent reports for a game with contributor data.
-
-    Returns list of report dicts, or None on failure/404.
-    Each report contains contributor.id, contributor.reportTally,
-    contributor.steam.playtime, etc.
-    """
-    counts = fetch_counts()
-    num_reports = counts["reports"]
-    counts_ts = counts["timestamp"]
-
-    hashed_id = _calculate_hashed_id(app_id, num_reports, counts_ts)
+def _fetch_page(app_id: int, page: int, num_reports: int, counts_ts: int) -> tuple[list[dict], int]:
+    """Fetch a single page of reports. Returns (reports, total)."""
+    hash1 = _get_hash(app_id, num_reports, counts_ts)
+    hash2 = _get_hash(page, app_id, counts_ts)
+    hash3 = f"p{hash1}*vRT{hash2}undefined"
+    hashed_id = _get_protondb_id(hash3)
     url = _REPORTS_URL.format(hashed_id=hashed_id)
 
     client = _get_client()
@@ -136,34 +130,53 @@ def fetch_reports(app_id: int) -> list[dict] | None:
         try:
             resp = client.get(url)
             if resp.status_code == 404:
-                log.debug("ProtonDB reports: no data for app %d", app_id)
-                return None
+                return [], 0
             if resp.status_code == 429:
                 wait = 2 ** (attempt + 1)
-                log.info("ProtonDB reports: rate limited for app %d, waiting %ds", app_id, wait)
+                log.info("ProtonDB reports: rate limited for app %d page %d, waiting %ds",
+                         app_id, page, wait)
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             data = resp.json()
-            reports = data.get("reports", [])
-            return reports
+            return data.get("reports", []), data.get("total", 0)
         except httpx.TimeoutException:
-            log.warning(
-                "ProtonDB reports: timeout for app %d (attempt %d/%d)",
-                app_id, attempt + 1, _MAX_RETRIES,
-            )
+            log.warning("ProtonDB reports: timeout app %d page %d (attempt %d/%d)",
+                        app_id, page, attempt + 1, _MAX_RETRIES)
             time.sleep(2 ** attempt)
         except Exception:
-            log.warning(
-                "ProtonDB reports: failed for app %d (attempt %d/%d)",
-                app_id, attempt + 1, _MAX_RETRIES, exc_info=True,
-            )
+            log.warning("ProtonDB reports: failed app %d page %d (attempt %d/%d)",
+                        app_id, page, attempt + 1, _MAX_RETRIES, exc_info=True)
             if attempt < _MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
             else:
-                return None
+                return [], 0
+    return [], 0
 
-    return None
+
+def fetch_reports(app_id: int, max_pages: int = 50) -> list[dict] | None:
+    """Fetch ALL reports for a game with contributor data (paginated).
+
+    Fetches all pages (40 reports per page) until no more pages.
+    Returns list of report dicts, or None on failure/404.
+    """
+    counts = fetch_counts()
+    num_reports = counts["reports"]
+    counts_ts = counts["timestamp"]
+
+    all_reports = []
+    for page in range(1, max_pages + 1):
+        reports, total = _fetch_page(app_id, page, num_reports, counts_ts)
+        if not reports:
+            break
+        all_reports.extend(reports)
+        if len(all_reports) >= total:
+            break
+
+    if not all_reports:
+        return None
+
+    return all_reports
 
 
 def extract_contributor_data(report: dict) -> dict | None:
