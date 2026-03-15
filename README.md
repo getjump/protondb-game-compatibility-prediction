@@ -140,20 +140,61 @@ IRT features are the #2 and #4 most important features in Stage 2. Combined with
 
 ### Experiment history
 
-50+ experiments across Phases 11-22. See [docs/](docs/) for detailed plans and results.
+50+ experiments across Phases 1-22. See [docs/](docs/) for detailed plans and results.
+
+#### Foundation (Phases 1-8)
+
+| Phase | Approach | Result |
+|---|---|---|
+| 1-3 | Python foundation, worker, preprocessing pipeline | Infrastructure |
+| 4 | Single LightGBM model → cascade (borked/works → tinkering/oob) | F1=0.593 → cascade +0.009 |
+| 5 | SVD embeddings (GPU×Game, CPU×Game co-occurrence) | +0.010 F1 |
+| 6 | Game metadata enrichment (Steam, PCGamingWiki, AWACY, GitHub) | +0.024 F1 |
+| 7 | Text features (keyword regex, sentiment, note lengths) | +0.008 F1 |
+| 8 | Rule-based relabeling (tinkering→oob if no effort markers) | +0.010 F1 |
+
+#### Noise reduction (Phases 9-10)
 
 | Phase | Approach | ΔF1 | Outcome |
 |---|---|---|---|
-| 11.2 | Alternative models (CatBoost, XGBoost) | −0.002 | LightGBM optimal |
-| **12.8** | **IRT features** | **+0.030** | **Decompose annotator bias** |
-| **13.2** | **Contributor-aware relabeling** | **+0.017** | **Replace Cleanlab + Phase 8** |
-| 14 | Steam PICS features | 0.000 | Redundant |
-| 15 | Temporal features, FM | −0.003..−0.017 | report_age_days sufficient |
-| **16** | **Class weight + error features** | **+0.006** | **Compensate class shift** |
-| **17** | **HP tuning (reg=1.0, oob_w=1.8)** | **+0.004** | **Stronger regularization** |
-| 18 | Threshold opt, focal loss, adaptive smooth | 0.000 | Already calibrated |
-| 19 | LLM verdict inference, data filtering | −0.001 | IRT already optimal |
-| **21** | **Per-game aggregation** | **+0.091** | **Majority vote at inference** |
+| 9.1 | Label smoothing α=0.15 (cross_entropy objective) | +0.008 | Noise-robust training |
+| 9.2 | Per-game aggregate features (26 features) | +0.024 | Community signals |
+| 9.3 | Cleanlab noise removal (3% of train) | +0.021 | Confident learning |
+| 9.4 | Ordinal classification, distillation, focal loss | 0.000 | All negative (6 experiments) |
+| 9.5 | Feature combinations, target encoding | −0.002 | All negative (8 experiments) |
+| 10 | Text embeddings (sentence-transformers SVD 32d) | +0.005 | Partial text coverage (32%) |
+
+#### IRT breakthrough (Phases 11-13) — main contribution
+
+| Phase | Approach | ΔF1 | Outcome |
+|---|---|---|---|
+| 11.2 | Alternative models (CatBoost, XGBoost, HistGBM) | −0.002 | LightGBM optimal |
+| **12.8** | **IRT features (game difficulty + annotator strictness)** | **+0.030** | **Key innovation** |
+| 12.1-12.3 | Contributor features, sample weighting | −0.002 | IRT dominates |
+| 13.1 | IRT-only relabeling (replaces Phase 8 + Cleanlab) | +0.013 | Simpler, better |
+| **13.2** | **Contributor-aware relabeling by annotator θ** | **+0.017** | **Graduated relabeling** |
+| 13.3 | Hybrid pipeline, confidence weighting | −0.001 | Weighting hurts |
+| 13.4-13.5 | Iterative IRT, annotator SVD embeddings | +0.001 | Marginal |
+
+#### Optimization attempts (Phases 14-19) — mostly negative
+
+| Phase | Approach | ΔF1 | Outcome |
+|---|---|---|---|
+| 14 | Steam PICS features (runtime, deck tests, review) | 0.000 | Redundant with existing |
+| 15 | Temporal features, Proton×Game SVD, Factorization Machines | −0.003..−0.017 | report_age_days sufficient |
+| **16** | **Class weight 1.8x oob + error features** | **+0.006** | **Compensate temporal shift** |
+| **17** | **HP tuning (reg=1.0) + ensemble** | **+0.004** | **Stronger regularization** |
+| 18 | Threshold optimization, focal loss, adaptive soft labels | 0.000 | Already calibrated |
+| 19 | LLM verdict inference (OpenRouter), data filtering | −0.001 | IRT already optimal |
+
+#### Task reformulation (Phases 20-22) — production framing
+
+| Phase | Approach | ΔF1 | Outcome |
+|---|---|---|---|
+| 20 | Per-(game, gpu) aggregated evaluation | — | F1 0.780→0.829 per-pair |
+| **21** | **Per-game majority vote aggregation** | **+0.091** | **Production metric: F1=0.871** |
+| 21.5 | Aggregated model (trained on pairs) | — | Leakage confirmed |
+| 21.7 | Cold-start model (metadata only) | — | Binary F1=0.601 |
 | 22 | Text embeddings upgrade, Stage 1 tuning | 0.000 | Pipeline saturated |
 
 ## Project structure
