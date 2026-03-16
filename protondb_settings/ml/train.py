@@ -681,7 +681,8 @@ def train_cascade_pipeline(
         # Replaces Phase 8 blind relabeling + Cleanlab noise removal
         if irt_theta:
             y_train, n_relabeled = contributor_aware_relabel(
-                y_train, train_rids, relabel_ids, conn, irt_theta)
+                y_train, train_rids, relabel_ids, conn, irt_theta,
+                theta_threshold=1.83)
             console.print(f"  Contributor-aware relabel: {n_relabeled} tinkering → works_oob")
         else:
             # Fallback: Phase 8 + Cleanlab when no contributor data
@@ -708,6 +709,7 @@ def train_cascade_pipeline(
         y_cal = y_test[:n_cal]
         X_eval = X_test.iloc[n_cal:].copy().reset_index(drop=True)
         y_eval = y_test[n_cal:]
+        eval_rids = _test_rids[n_cal:]
 
         # Preserve categorical dtypes
         from .models.classifier import CATEGORICAL_FEATURES as _CAT_FEATS
@@ -792,6 +794,12 @@ def train_cascade_pipeline(
 
         results["ece_before"] = ece_before
         results["ece_after"] = ece_after
+
+        # Per-game aggregated evaluation
+        from .evaluate import evaluate_per_game, print_per_game_results
+        per_game = evaluate_per_game(cascade, X_eval, y_eval, eval_rids, conn)
+        print_per_game_results(per_game)
+        results["per_game"] = per_game
 
         # Step 8: Export
         console.print("\n[bold]Step 9/9: Exporting artifacts...[/bold]")

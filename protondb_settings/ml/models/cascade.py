@@ -53,7 +53,7 @@ def train_stage1(
 ) -> lgb.LGBMClassifier:
     """Train Stage 1: borked (0) vs works (1)."""
     if class_weight is None:
-        class_weight = {0: 3.0, 1: 1.0}
+        class_weight = {0: 4.64, 1: 1.0}
 
     if categorical_cols is None:
         categorical_cols = [c for c in CATEGORICAL_FEATURES if c in X_train.columns]
@@ -62,9 +62,9 @@ def train_stage1(
     y_test_bin = (y_test > 0).astype(int)
 
     model = lgb.LGBMClassifier(
-        n_estimators=3000, num_leaves=63, learning_rate=0.05,
-        max_depth=-1, min_child_samples=20, subsample=0.8,
-        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
+        n_estimators=3000, num_leaves=81, learning_rate=0.073,
+        max_depth=-1, min_child_samples=79, subsample=0.61,
+        colsample_bytree=0.50, reg_alpha=1.87, reg_lambda=0.007,
         class_weight=class_weight, n_jobs=-1, random_state=42,
         verbose=-1, importance_type="gain",
     )
@@ -95,7 +95,7 @@ def train_stage2(
     y_test: np.ndarray,
     categorical_cols: list[str] | None = None,
     drop_features: list[str] | None = None,
-    label_smoothing: float = 0.15,
+    label_smoothing: float = 0.034,
 ) -> tuple[lgb.Booster, list[str]]:
     """Train Stage 2: tinkering (0) vs works_oob (1), non-borked only.
 
@@ -144,7 +144,7 @@ def train_stage2(
     # Phase 16+17: upweight works_oob (class 1) to compensate for temporal
     # distribution shift (9.9% train vs 18.1% test). oob_weight=1.8, reg=1.0 (Phase 17.1)
     sample_weight = np.ones(len(y_train_s2))
-    sample_weight[y_train_s2 >= 0.5] = 1.8  # works_oob (after smoothing: 0.85)
+    sample_weight[y_train_s2 >= 0.5] = 1.53  # works_oob (Optuna-tuned)
 
     ds_train = lgb.Dataset(X_train_s2, label=y_smooth, weight=sample_weight,
                            categorical_feature=cat_cols_s2)
@@ -154,15 +154,15 @@ def train_stage2(
     params = {
         "objective": "cross_entropy",
         "metric": "binary_logloss",
-        "num_leaves": 63,
-        "learning_rate": 0.03,
-        "min_child_samples": 50,
-        "subsample": 0.8,
+        "num_leaves": 65,
+        "learning_rate": 0.013,
+        "min_child_samples": 55,
+        "subsample": 0.86,
         "subsample_freq": 1,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.0,
-        "min_split_gain": 0.05,
+        "colsample_bytree": 0.52,
+        "reg_alpha": 0.33,
+        "reg_lambda": 0.043,
+        "min_split_gain": 0.109,
         "verbose": -1,
     }
 

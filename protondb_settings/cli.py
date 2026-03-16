@@ -617,6 +617,41 @@ def ml_train_cascade(config: Config, output_dir: Path | None, test_fraction: flo
     click.echo(f"Cascade F1 (macro): {results['f1_macro']:.4f}")
 
 
+@ml.command("optimize")
+@click.option("--n-trials", type=int, default=50, help="Number of Optuna trials.")
+@click.option("--output-dir", type=click.Path(path_type=Path), default=None,
+              help="Output directory (default: same as db dir).")
+@click.option("--test-fraction", type=float, default=0.2)
+@click.option("--normalized-data", type=click.Choice(["heuristic", "llm"]),
+              default=None, envvar="NORMALIZED_DATA_SOURCE")
+@pass_config
+def ml_optimize(config: Config, n_trials: int, output_dir: Path | None,
+                test_fraction: float, normalized_data: str | None) -> None:
+    """Optimize cascade hyperparameters with Optuna."""
+    import logging
+
+    from protondb_settings.db.connection import get_connection
+    from protondb_settings.db.migrations import ensure_schema
+    from protondb_settings.ml.optimize import run_optimization
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    conn = get_connection(config.db_path)
+    ensure_schema(conn)
+
+    if output_dir is None:
+        output_dir = config.db_path.parent
+
+    results = run_optimization(
+        conn, n_trials=n_trials, output_dir=output_dir,
+        test_fraction=test_fraction,
+        normalized_data_source=normalized_data,
+    )
+    conn.close()
+
+    click.echo(f"\nBest F1 (optimization): {results['best_f1_opt']:.4f}")
+    click.echo(f"Best F1 (eval):         {results['best_f1_eval']:.4f}")
+
+
 @ml.command("evaluate")
 @click.option("--model-path", type=click.Path(exists=True, path_type=Path), default=None,
               help="Path to model.pkl (default: data/model.pkl).")
